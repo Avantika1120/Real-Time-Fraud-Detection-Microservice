@@ -1,65 +1,73 @@
 # Real-Time Fraud Detection Microservice
 
-A production-style **FastAPI microservice** for real-time credit-card fraud scoring. The repository separates offline model training from online inference and packages the prediction service with Docker and CI.
+> Production-style **FastAPI + XGBoost** service for low-latency credit-card fraud scoring, with offline training, model artifact versioning, Docker, tests, GitHub Actions, and an AWS deployment pattern.
 
-## Problem
+![Fraud API demo preview](docs/demo.svg)
 
-Fraud detection systems must score transactions quickly while handling extreme class imbalance. This project trains a supervised classifier on the widely used credit-card transaction dataset (~284K transactions), persists the model artifact, and exposes low-latency fraud probabilities through a REST API.
+## What this project demonstrates
+
+- Separation of offline model training from online inference
+- Imbalance-aware fraud classification using XGBoost
+- ROC-AUC and PR-AUC evaluation
+- Persisted model + feature contract using `joblib`
+- Typed FastAPI REST endpoints for health, model metadata, and scoring
+- Configurable decision threshold
+- Dockerized inference service
+- Automated tests and GitHub Actions CI
+- AWS ECS/Fargate / Lambda deployment design
 
 ## Architecture
 
-```text
-Historical transactions
-        |
-        v
-Validation + preprocessing
-        |
-        v
-Stratified train/test split
-        |
-        v
-XGBoost classifier
-(class-imbalance weighting)
-        |
-        v
-ROC-AUC / PR-AUC evaluation
-        |
-        v
-joblib model artifact
-        |
-        v
-FastAPI inference service
-        |
-        +--> /health
-        +--> /model-info
-        +--> /predict
-        |
-        v
-Docker container
-        |
-        v
-AWS deployment pattern
-(API Gateway / ALB -> ECS or Lambda)
+```mermaid
+flowchart LR
+    D[(Historical transactions)] --> T[train.py]
+    T --> M[XGBoost training]
+    M --> E[ROC-AUC / PR-AUC]
+    E --> A[(Model artifact)]
+    C[Client transaction] --> F[FastAPI /predict]
+    A --> F
+    F --> V[Feature validation]
+    V --> I[Fraud probability]
+    I --> R[Risk decision]
+    F --> K[Docker]
+    K --> W[AWS deployment]
 ```
 
-## Engineering focus
+Detailed architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
-- **Offline/online separation:** training code is independent from serving code.
-- **Imbalance-aware modeling:** positive-class weighting is derived from training data.
-- **Stable feature contract:** the saved artifact stores the exact feature order used by the API.
-- **Configurable decision threshold:** probability scoring is separated from the binary fraud decision.
-- **Health and metadata endpoints:** useful for deployment probes and debugging.
-- **Docker + CI:** reproducible runtime and automated tests.
+## Repository structure
+
+```text
+Real-Time-Fraud-Detection-Microservice/
+├── app/
+│   ├── main.py                 # FastAPI routes
+│   └── model.py                # artifact loading, validation, prediction
+├── artifacts/
+│   └── .gitkeep                # trained model written here locally
+├── data/
+│   └── .gitkeep                # raw creditcard.csv lives here locally
+├── tests/
+│   └── test_api.py
+├── deploy/
+│   └── aws.md                  # AWS production deployment pattern
+├── docs/
+│   ├── ARCHITECTURE.md
+│   └── demo.svg
+├── .github/workflows/
+│   └── ci.yml                  # automated test workflow
+├── train.py                    # offline training/evaluation pipeline
+├── Dockerfile
+├── requirements.txt
+└── README.md
+```
 
 ## Dataset
 
-The training script expects the Kaggle/ULB credit-card fraud dataset as `data/creditcard.csv`, with columns:
+The training pipeline expects the ULB/Kaggle credit-card fraud dataset as `data/creditcard.csv` with the standard feature schema:
 
 `Time, V1 ... V28, Amount, Class`
 
-`Class=1` represents fraud.
-
-The original dataset contains approximately **284,807 transactions**. The raw CSV is intentionally not committed to this repository.
+`Class = 1` denotes a fraudulent transaction. The original dataset contains approximately **284,807 transactions**; the CSV is intentionally not committed to source control.
 
 ## Train the model
 
@@ -72,17 +80,19 @@ mkdir -p data artifacts
 python train.py --data data/creditcard.csv --output artifacts/fraud_model.joblib
 ```
 
-Training prints ROC-AUC, PR-AUC, confusion matrix, and the selected threshold, then saves a deployable artifact.
+The training pipeline performs a stratified split, applies imbalance-aware training, evaluates probability quality, and persists the trained model together with the feature order and decision threshold.
 
-> **Metric integrity:** the resume-level ~0.97 ROC-AUC figure should only be presented as verified after running this training/evaluation pipeline on the exact dataset/version used for that result. This repository does not hard-code an evaluation metric.
+### Metric integrity
 
-## Run the API
+The resume-level **~0.97 ROC-AUC** should be presented as a verified result only after reproducing it on the exact dataset/version and experiment configuration that produced it. The repository computes evaluation metrics at training time; it does **not** hard-code an AUC value.
 
-```bash
-uvicorn app.main:app --reload
-```
+## API
 
-Swagger UI: `http://localhost:8000/docs`
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/health` | GET | Service and model readiness |
+| `/model-info` | GET | Stored model metadata and feature contract |
+| `/predict` | POST | Return fraud probability and decision |
 
 ### Example request
 
@@ -99,9 +109,9 @@ POST /predict
 }
 ```
 
-For a trained artifact, the request must include every feature stored in the model contract.
+A real request must contain every feature stored in the trained artifact's feature contract.
 
-Example response:
+Example response shape:
 
 ```json
 {
@@ -111,36 +121,46 @@ Example response:
 }
 ```
 
-## Project structure
+## Run the API
 
-```text
-app/
-  main.py
-  model.py
-artifacts/
-  .gitkeep
-data/
-  .gitkeep
-train.py
-tests/
-  test_api.py
-deploy/
-  aws.md
-.github/workflows/
-  ci.yml
-Dockerfile
-requirements.txt
+```bash
+uvicorn app.main:app --reload
 ```
+
+Swagger UI: `http://localhost:8000/docs`
+
+## Docker
+
+```bash
+docker build -t fraud-detection-api .
+docker run -p 8000:8000 -v "$(pwd)/artifacts:/app/artifacts" fraud-detection-api
+```
+
+The container expects a trained artifact at the configured artifact path. Training and serving remain intentionally separate.
+
+## GitHub Actions
+
+`.github/workflows/ci.yml` runs automated validation on pushes and pull requests so API changes are checked before merge. The workflow installs dependencies and executes the test suite.
 
 ## AWS deployment pattern
 
-The service can be containerized and deployed to **Amazon ECS/Fargate** behind an Application Load Balancer, or adapted for **AWS Lambda + API Gateway** for serverless inference. See `deploy/aws.md`.
+The Docker image can be pushed to **Amazon ECR** and deployed on **ECS/Fargate** behind an Application Load Balancer. The repository also documents a Lambda + API Gateway alternative for lighter serverless traffic. See [deploy/aws.md](deploy/aws.md).
+
+## Engineering decisions
+
+- **Offline/online separation:** production API startup never retrains the model.
+- **Stable feature contract:** the artifact stores training-time feature order to prevent silent inference bugs.
+- **Probability-first API:** downstream systems receive a score and can tune the operating threshold based on fraud-cost tradeoffs.
+- **Class imbalance awareness:** model training derives weighting from the training distribution.
+- **Deployment observability:** health and metadata endpoints support probes and debugging.
+- **Reproducibility:** source, requirements, Docker, tests, CI, and deployment notes live in one repository.
 
 ## Next improvements
 
-- Add model registry/versioning
-- Add drift monitoring and feature-distribution checks
-- Add authentication and rate limiting
-- Add asynchronous event scoring through SQS/Kinesis
-- Add CloudWatch metrics and alarms
-- Add canary deployment for new model versions
+- Model registry and semantic model versions
+- Precision/recall threshold tuning based on fraud cost
+- Feature drift and score-distribution monitoring
+- CloudWatch dashboards and alarms
+- Authentication and rate limiting
+- Streaming scoring through Kinesis/SQS
+- Canary deployment for new model versions
